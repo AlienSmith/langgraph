@@ -1,0 +1,23 @@
+{
+    "name": "LangGraph-Fun",
+    "image": "langgraph-dev:latest",
+    "runArgs": [
+        "--gpus=all",
+        "--runtime=nvidia",
+        "--net=host"
+    ],
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "python.terminal.useEnvFile": true,
+                "python.envFile": "${workspaceFolder}/.env"
+            },
+            "extensions": [
+                "ms-python.python"
+            ]
+        }
+    },
+    "workspaceFolder": "/workspace",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+    "remoteUser": "root"
+}
