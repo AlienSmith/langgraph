@@ -57,7 +57,7 @@ def get_soft_rect(n_curves=16, power=8):
     # 2. Warp t to cluster points at corners (pi/4, 3pi/4, etc.)
     # The sin(4t) term creates 4 "bunches" of points
     # Adjust 0.1 to a higher value (like 0.15) for even tighter corners
-    t = t_linear - 0.1 * np.sin(4 * t_linear)
+    t = 0.5 + t_linear - 0.1 * np.sin(4 * t_linear)
 
     # 3. Standard Superellipse Formula
     cos_t = np.cos(t)
