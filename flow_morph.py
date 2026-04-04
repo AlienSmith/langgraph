@@ -1,52 +1,23 @@
-from matplotlib.animation import FuncAnimation
 import torch
 import torch.nn as nn
 import numpy as np
 import json
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+
+# --- 1. SHAPE DATA (32 points: Anchor, Control, Anchor...) ---
 
 
-def plot_morph(x0, x1, model, steps=5):
-    plt.figure(figsize=(8, 8))
-
-    # Reshape for plotting
-    x0_p = x0.reshape(32, 2).numpy()
-    x1_p = x1.reshape(32, 2).numpy()
-
-    # Plot start and end shapes
-    plt.scatter(x0_p[:, 0], x0_p[:, 1], color='blue',
-                label='Circle (Start)', alpha=0.5)
-    plt.scatter(x1_p[:, 0], x1_p[:, 1], color='red',
-                label='Squircle (End)', alpha=0.5)
-
-    # Plot the "velocity" vectors from the model at t=0.5
-    t_mid = torch.tensor([[0.5]])
-    x_mid = (0.5 * x0 + 0.5 * x1).unsqueeze(0)
-    v = model(x_mid, t_mid).detach().numpy().reshape(32, 2)
-    x_mid_p = x_mid.detach().numpy().reshape(32, 2)
-
-    plt.quiver(x_mid_p[:, 0], x_mid_p[:, 1], v[:, 0],
-               v[:, 1], color='green', label='Flow Velocity')
-
-    plt.legend()
-    plt.axis('equal')
-    plt.title("Flow Matching: Shape Morphing Vectors")
-
-    # Save instead of show to avoid Docker GUI issues
-    plt.savefig("morph_plot.png")
-    print("Plot saved as morph_plot.png")
-
-# Call this in your __main__
-# plot_morph(x0, x1, model)
+def get_circle(n_points=32):
+    t = np.linspace(0, 2*np.pi, n_points, endpoint=False)
+    return torch.tensor(np.stack([np.cos(t), np.sin(t)], axis=1), dtype=torch.float32)
 
 
-# --- 1. SHAPE GENERATION ---
-def get_circle(n_curves=16):
-    # 32 points total: alternating Anchor and Control
-    t = np.linspace(0, 2*np.pi, n_curves * 2, endpoint=False)
-    # Standard circle radius 1.0
-    x = np.cos(t)
-    y = np.sin(t)
+def get_twisted_test_pose(n_points=32):
+    t = np.linspace(0, 2*np.pi, n_points, endpoint=False)
+    # The flip: Y is inverted. Lerp would collapse this at t=0.5.
+    x = 1.3 * np.cos(t)
+    y = -1.3 * np.sin(t)
     return torch.tensor(np.stack([x, y], axis=1), dtype=torch.float32)
 
 
@@ -72,147 +43,162 @@ def get_soft_rect(n_curves=16, power=8):
 
     return torch.tensor(np.stack([x, y], axis=1), dtype=torch.float32)
 
+# --- 2. THE FLOW MODEL ---
+
 
 class FlowModel(nn.Module):
     def __init__(self):
         super().__init__()
-        # Input: 32 points * 2 coords + 1 time = 65
         self.net = nn.Sequential(
-            nn.Linear(65, 256),
-            nn.ELU(),
-            nn.Linear(256, 256),
-            nn.ELU(),
-            nn.Linear(256, 64)  # Output: velocity for 32 points (dx, dy)
+            nn.Linear(65, 256), nn.ELU(),
+            nn.Linear(256, 256), nn.ELU(),
+            nn.Linear(256, 64)
         )
 
     def forward(self, x, t):
-        # Ensure t has the same batch dimension as x
-        # If x is [Batch, 64] and t is [1], we need t to be [Batch, 1]
-        if t.dim() == 1:
-            t = t.unsqueeze(0)
+        # If x is [64], make it [1, 64]
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
 
-        # This joins them along the last axis: [Batch, 64 + 1]
+        # If t is a scalar or [1], make it [Batch, 1]
+        if t.dim() == 0:
+            t = t.view(1, 1)
+        elif t.dim() == 1:
+            t = t.unsqueeze(1)
+
+        # If x and t have different batch sizes (usually 1 vs N),
+        # expand t to match x
+        if t.size(0) != x.size(0):
+            t = t.expand(x.size(0), -1)
+
         return self.net(torch.cat([x, t], dim=-1))
 
-# --- 3. TRAINING ---
+
+def get_signed_area(p):
+    if p.dim() == 2:
+        p = p.unsqueeze(0)
+    x, y = p[:, :, 0], p[:, :, 1]
+    return 0.5 * torch.sum(x * torch.roll(y, -1, 1) - torch.roll(x, -1, 1) * y, dim=1)
+
+# --- 3. TRAINING --
 
 
-# --- 3. TRAINING ---
-def train():
-    x0 = get_circle().flatten()
-    x1 = get_soft_rect().flatten()
-
-    model = FlowModel()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-    print("Training Flow Matching Model...")
-    for i in range(2000):
-        optimizer.zero_grad()
-        t = torch.rand(1, 1)  # Shape: [1, 1]
-
-        # xt inherits the [1, 64] shape from t
-        xt = (1 - t) * x0 + t * x1
-
-        target_v = x1 - x0
-
-        # REMOVE .unsqueeze(0) HERE
-        v_pred = model(xt, t)
-
-        # Ensure target_v matches the shape of v_pred [1, 64]
-        loss = torch.mean((v_pred - target_v.unsqueeze(0))**2)
-
-        loss.backward()
-        optimizer.step()
-
-        if i % 500 == 0:
-            print(f"Step {i}, Loss: {loss.item():.6f}")
-
-    return model, x0, x1
-# --- 4. INFERENCE (The Animation) ---
-
-
-def generate_animation(model, x0, steps=50):
-    print("Generating Morph...")
-    current_x = x0.unsqueeze(0)
-    dt = 1.0 / steps
-    frames = []
-
-    for i in range(steps + 1):
-        t = torch.tensor([[i * dt]])
-        frames.append(current_x.detach().numpy().reshape(32, 2).tolist())
-
-        # Euler Integration
-        if i < steps:
-            v = model(current_x, t)
-            current_x = current_x + v * dt
-
-    return frames
-
-
-def save_gif(animation_data):
-    fig, ax = plt.subplots(figsize=(6, 6))
-    line, = ax.plot([], [], 'o-', lw=2)
-    ax.set_xlim(-1.5, 1.5)
-    ax.set_ylim(-1.5, 1.5)
-
-    def update(frame):
-        points = np.array(frame)
-        line.set_data(points[:, 0], points[:, 1])
-        return line,
-
-    ani = FuncAnimation(fig, update, frames=animation_data, blit=True)
-    ani.save('morph.gif', writer='pillow', fps=30)
-    print("Animation saved as morph.gif")
-
-
-def get_bezier_points(p0, p1, p2, num_steps=10):
-    """Calculates points along a quadratic Bezier curve."""
+def get_bezier_points(p0, p1, p2, num_steps=15):
     t = np.linspace(0, 1, num_steps)
-    # Quadratic Bezier Formula: (1-t)^2*P0 + 2(1-t)t*P1 + t^2*P2
     points = (1-t)[:, None]**2 * p0 + 2*(1-t)[:, None] * \
         t[:, None] * p1 + t[:, None]**2 * p2
     return points
 
 
-def save_bezier_gif(animation_data):
+def save_bezier_gif(model, x0, steps=60):
+    print("🎬 Rendering Smooth Bezier GIF...")
     fig, ax = plt.subplots(figsize=(6, 6))
-    line, = ax.plot([], [], 'b-', lw=2)  # The smooth curve
-    dots, = ax.plot([], [], 'ro', markersize=4,
-                    alpha=0.3)  # The raw data points
+    line, = ax.plot([], [], 'b-', lw=2.5)
+    dots, = ax.plot([], [], 'ro', markersize=3, alpha=0.2)
+    ax.set_xlim(-2, 2)
+    ax.set_ylim(-2, 2)
 
-    ax.set_xlim(-1.5, 1.5)
-    ax.set_ylim(-1.5, 1.5)
+    # 1. Generate Raw Point Data
+    current_x = x0.unsqueeze(0)
+    dt = 1.0 / steps
+    animation_data = []
+    for i in range(steps + 1):
+        t_val = torch.tensor([[i * dt]])
+        pts = current_x.detach().numpy().reshape(32, 2)
+        animation_data.append(pts)
+        if i < steps:
+            with torch.no_grad():
+                v = model(current_x, t_val)
+                current_x = current_x + v * dt
 
     def update(frame):
-        pts = np.array(frame)
+        pts = animation_data[frame]
         all_curve_pts = []
-
-        # Loop through points in steps of 2 (Anchor, Control)
         for i in range(0, len(pts), 2):
-            p0 = pts[i]
-            p1 = pts[i+1]
-            p2 = pts[(i+2) % len(pts)]  # Next anchor (wrap around)
-
-            segment = get_bezier_points(p0, p1, p2)
-            all_curve_pts.append(segment)
+            p0, p1 = pts[i], pts[i+1]
+            p2 = pts[(i+2) % len(pts)]
+            all_curve_pts.append(get_bezier_points(p0, p1, p2))
 
         curve_data = np.concatenate(all_curve_pts)
         line.set_data(curve_data[:, 0], curve_data[:, 1])
         dots.set_data(pts[:, 0], pts[:, 1])
         return line, dots
 
-    from matplotlib.animation import FuncAnimation
-    ani = FuncAnimation(fig, update, frames=animation_data, blit=True)
+    ani = FuncAnimation(fig, update, frames=len(animation_data), blit=True)
     ani.save('morph_bezier.gif', writer='pillow', fps=30)
+    print("✅ Done! Saved as morph_bezier.gif")
+
+
+def train_flow_model_slow_cook(poses, steps=60000):
+    device = torch.device("cuda")
+    model = FlowModel().to(device)
+
+    # 1. LOWER LEARNING RATE (The 'Slow-Cook')
+    # 5e-5 is much safer for high-tension physics
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=5e-5, weight_decay=1e-6)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=steps)
+
+    p0 = poses[0].to(device)  # [32, 2]
+    p1 = poses[1].to(device)  # [32, 2]
+    rest_lengths = torch.norm(p0 - torch.roll(p0, 1, 0), dim=1)
+
+    print(f"🔥 Slow-Cooking Physics (60k steps)...")
+    for i in range(steps + 1):
+        optimizer.zero_grad()
+        t = torch.rand(1, device=device)
+
+        # We use a bit of noise (0.002) to help the model explore 'around' the path
+        xt = (1.0 - t) * p0 + t * p1 + torch.randn_like(p0) * 0.002
+        xt_flat = xt.flatten().unsqueeze(0)
+
+        v_pred = model(xt_flat, t.view(1, 1))
+        v_reshaped = v_pred.view(32, 2)
+
+        # --- THE REFINED PHYSICS ---
+
+        # A. FLOW MATCHING (Baseline)
+        target_v = (p1 - p0).flatten().unsqueeze(0)
+        loss_flow = torch.mean((v_pred - target_v)**2)
+
+        # B. STIFFNESS (Lowered weight to prevent 'Explosions')
+        dt = 0.02  # Smaller look-ahead for stability
+        p_next = xt + v_reshaped * dt
+        current_lengths = torch.norm(p_next - torch.roll(p_next, 1, 0), dim=1)
+        loss_stiff = torch.mean((current_lengths - rest_lengths)**2) * 500.0
+
+        # C. AREA CONSERVATION
+        area_now = get_signed_area(p_next)
+        loss_area = torch.mean(
+            (area_now / get_signed_area(p0) - 1.0)**2) * 50.0
+
+        # D. RADIUS PRESERVATION (Center of Mass)
+        center = torch.mean(xt, dim=0)
+        dist_to_center = torch.norm(p_next - center, dim=1)
+        rest_dist = torch.norm(p0 - center, dim=1)
+        loss_radius = torch.mean((dist_to_center - rest_dist)**2) * 200.0
+
+        # TOTAL LOSS
+        total_loss = (loss_flow * 0.5) + loss_stiff + loss_area + loss_radius
+
+        total_loss.backward()
+
+        # 2. AGGRESSIVE GRADIENT CLIPPING
+        # This is the 'Shield' that stops the explosions.
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.05)
+
+        optimizer.step()
+        scheduler.step()
+
+        if i % 10000 == 0:
+            print(
+                f"Step {i:5} | Area: {area_now.item():.4f} | Stiff: {loss_stiff.item():.4f}")
+
+    return model.cpu(), p0.flatten().cpu()
 
 
 if __name__ == "__main__":
-    model, x0, x1 = train()
-    animation_data = generate_animation(model, x0)
-    plot_morph(x0, x1, model)
-    save_gif(animation_data)
-    save_bezier_gif(animation_data)
-    # Save to JSON for your 2D Curve Library
-    with open("morph_animation.json", "w") as f:
-        json.dump(animation_data, f)
-    print("Done! Animation saved to morph_animation.json")
+    poses = [get_circle(), get_twisted_test_pose()]
+    model, x0 = train_flow_model_slow_cook(poses)
+    save_bezier_gif(model, x0)
