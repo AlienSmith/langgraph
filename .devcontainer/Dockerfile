@@ -15,9 +15,10 @@ RUN pip install --no-cache-dir \
     python-dotenv \
     httpx
 
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir \
-    --extra-index-url https://download.pytorch.org/whl/cpu \
-    torch \
-    numpy \
-    matplotlib
+# 1. First, install the standard packages from the default PyPI
+RUN pip install --no-cache-dir numpy matplotlib
+
+# 2. Then, install the GPU-heavy Torch packages from the specialized index
+RUN pip install --no-cache-dir \
+    torch torchvision torchaudio \
+    --extra-index-url https://download.pytorch.org/whl/cu121

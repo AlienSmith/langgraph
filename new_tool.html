@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>32-Point Quad Bézier Shape Editor (Pro)</title>
+    <style>
+        :root {
+            --bg: #1a1a1a;
+            --panel: #222;
+            --border: #333;
+            --text: #eee;
+            --accent: #2563eb;
+        }
+
+        body {
+            margin: 0;
+            background: var(--bg);
+            color: var(--text);
+            font-family: system-ui, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        header {
+            padding: 10px 0;
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            background: var(--panel);
+            width: 100%;
+            justify-content: center;
+            border-bottom: 1px solid var(--border);
+            flex-wrap: wrap;
+        }
+
+        button {
+            background: #333;
+            color: #eee;
+            border: 1px solid #444;
+            padding: 6px 12px;
+            cursor: pointer;
+            border-radius: 4px;
+            font-size: 13px;
+            transition: all 0.15s;
+        }
+
+        button:hover {
+            background: #444;
+        }
+
+        button.primary {
+            background: var(--accent);
+            border-color: #1d4ed8;
+        }
+
+        button.primary:hover {
+            background: #1d4ed8;
+        }
+
+        button:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        .toggle {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 12px;
+            color: #aaa;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .canvas-wrap {
+            position: relative;
+            margin: 10px;
+        }
+
+        canvas {
+            background: #111;
+            border: 1px solid var(--border);
+            cursor: crosshair;
+        }
+
+        .info {
+            font-size: 12px;
+            color: #888;
+            text-align: center;
+            margin-bottom: 4px;
+        }
+
+        .props {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(34, 34, 34, 0.95);
+            border: 1px solid #444;
+            padding: 10px;
+            border-radius: 6px;
+            font-size: 12px;
+            display: none;
+            min-width: 160px;
+        }
+
+        .props label {
+            display: block;
+            margin: 4px 0;
+            color: #aaa;
+        }
+
+        .props input {
+            width: 80px;
+            background: #111;
+            border: 1px solid #444;
+            color: #fff;
+            padding: 3px 6px;
+            border-radius: 3px;
+        }
+
+        #toast {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #22c55e;
+            color: #fff;
+            padding: 8px 16px;
+            border-radius: 6px;
+            opacity: 0;
+            transition: opacity 0.3s;
+            pointer-events: none;
+            z-index: 999;
+        }
+
+        #toast.error {
+            background: #ef4444;
+        }
+
+        #toast.show {
+            opacity: 1;
+        }
+
+        .status {
+            font-size: 11px;
+            color: #666;
+            margin-top: 2px;
+        }
+
+        .status.warn {
+            color: #f59e0b;
+        }
+
+        .status.ok {
+            color: #22c55e;
+        }
+    </style>
+</head>
+
+<body>
+
+    <header>
+        <button onclick="loadPreset('circle')">⭕ Circle</button>
+        <button onclick="loadPreset('heart')">❤️ Heart</button>
+        <button onclick="loadPreset('star')">⭐ Star</button>
+        <div style="width: 1px; height: 20px; background: #444; margin: 0 4px;"></div>
+        <button id="undoBtn" onclick="undo()" disabled>↩️ Undo</button>
+        <button id="redoBtn" onclick="redo()" disabled>↪️ Redo</button>
+        <div style="width: 1px; height: 20px; background: #444; margin: 0 4px;"></div>
+        <label class="toggle"><input type="checkbox" id="normalize" checked> Normalize [-1,1]</label>
+        <label class="toggle"><input type="checkbox" id="highRes"> Show High-Res Preview</label>
+        <div style="width: 1px; height: 20px; background: #444; margin: 0 4px;"></div>
+        <button onclick="document.getElementById('importInput').click()">📂 Import JSON</button>
+        <input type="file" id="importInput" accept=".json" style="display:none">
+        <button class="primary" onclick="downloadJSON()">💾 Export JSON</button>
+    </header>
+
+    <div class="info">Drag points to edit. Blue=Anchors, Red=Controls. Ctrl+Z/Y for undo/redo. Click point for precise
+        edit.</div>
+    <div class="canvas-wrap">
+        <canvas id="canvas" width="800" height="800"></canvas>
+        <div class="props" id="propsPanel">
+            <div style="font-weight:bold; margin-bottom:6px;">Point <span id="ptIdx">-</span></div>
+            <label>X: <input type="number" id="ptX" step="0.01"></label>
+            <label>Y: <input type="number" id="ptY" step="0.01"></label>
+            <div class="status" id="statusMsg">Ready</div>
+        </div>
+    </div>
+    <div id="toast">Ready</div>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const pts = new Array(32).fill(null).map((_, i) => ({ x: 0, y: 0, anchor: i % 2 === 0 }));
+        const SCALE = 150;
+
+        // ================= STATE MANAGEMENT =================
+        let history = [], historyIdx = -1;
+        function deepCopyState() { return pts.map(p => ({ x: p.x, y: p.y })); }
+        function saveState() {
+            if (historyIdx < history.length - 1) history = history.slice(0, historyIdx + 1);
+            history.push(deepCopyState());
+            historyIdx = history.length - 1;
+            updateUndoButtons();
+        }
+        function restoreState() {
+            const state = history[historyIdx];
+            for (let i = 0; i < pts.length; i++) { pts[i].x = state[i].x; pts[i].y = state[i].y; }
+            updateUndoButtons(); draw();
+        }
+        function undo() { if (historyIdx > 0) { historyIdx--; restoreState(); } }
+        function redo() { if (historyIdx < history.length - 1) { historyIdx++; restoreState(); } }
+        function updateUndoButtons() {
+            document.getElementById('undoBtn').disabled = historyIdx <= 0;
+            document.getElementById('redoBtn').disabled = historyIdx >= history.length - 1;
+        }
+
+        // ================= COORDINATE TRANSFORM =================
+        function toScreen(p) { return { x: canvas.width / 2 + p.x * SCALE, y: canvas.height / 2 - p.y * SCALE }; }
+        function toWorld(sx, sy) { return { x: (sx - canvas.width / 2) / SCALE, y: (canvas.height / 2 - sy) / SCALE }; }
+
+        // ================= DRAWING =================
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.save();
+
+            // Grid
+            ctx.strokeStyle = '#222'; ctx.lineWidth = 1;
+            for (let i = -canvas.width / 2; i < canvas.width / 2; i += SCALE / 2) {
+                ctx.beginPath(); ctx.moveTo(canvas.width / 2 + i, 0); ctx.lineTo(canvas.width / 2 + i, canvas.height); ctx.stroke();
+                ctx.beginPath(); ctx.moveTo(0, canvas.height / 2 - i); ctx.lineTo(canvas.width, canvas.height / 2 - i); ctx.stroke();
+            }
+
+            // Main 32-pt curve
+            ctx.strokeStyle = '#4ade80'; ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(toScreen(pts[0]).x, toScreen(pts[0]).y);
+            for (let i = 0; i < 16; i++) {
+                let c = toScreen(pts[2 * i + 1]);
+                let e = toScreen(pts[(2 * i + 2) % 32]);
+                ctx.quadraticCurveTo(c.x, c.y, e.x, e.y);
+            }
+            ctx.stroke();
+
+            // 🔹 HIGH-RES PREVIEW (Isolated State)
+            if (showHighRes) {
+                const resPts = evaluateHighRes(64); // 64 points total
+                if (resPts.length > 0) {
+                    ctx.save();
+                    ctx.strokeStyle = 'rgba(148, 163, 184, 0.8)';
+                    ctx.lineWidth = 2;
+                    ctx.setLineDash([4, 3]);
+                    ctx.beginPath();
+                    let s0 = toScreen(resPts[0]);
+                    ctx.moveTo(s0.x, s0.y);
+                    for (let i = 1; i < resPts.length; i++) {
+                        let s = toScreen(resPts[i]);
+                        ctx.lineTo(s.x, s.y);
+                    }
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+
+                    // Draw preview dots
+                    ctx.fillStyle = 'rgba(251, 191, 36, 0.9)';
+                    for (let i = 0; i < resPts.length; i += 4) { // Skip some for performance/clarity
+                        let s = toScreen(resPts[i]);
+                        ctx.beginPath(); ctx.arc(s.x, s.y, 2.5, 0, Math.PI * 2); ctx.fill();
+                    }
+                    ctx.restore();
+                }
+            }
+
+            // Control lines
+            ctx.strokeStyle = '#666'; ctx.setLineDash([5, 4]); ctx.lineWidth = 1;
+            for (let i = 0; i < 16; i++) {
+                let c = toScreen(pts[2 * i + 1]);
+                let a1 = toScreen(pts[2 * i]);
+                let a2 = toScreen(pts[(2 * i + 2) % 32]);
+                ctx.beginPath(); ctx.moveTo(a1.x, a1.y); ctx.lineTo(c.x, c.y); ctx.stroke();
+                ctx.beginPath(); ctx.moveTo(a2.x, a2.y); ctx.lineTo(c.x, c.y); ctx.stroke();
+            }
+            ctx.setLineDash([]);
+
+            // Points
+            pts.forEach((p, i) => {
+                let s = toScreen(p);
+                ctx.beginPath(); ctx.arc(s.x, s.y, p.anchor ? 6 : 4, 0, Math.PI * 2);
+                ctx.fillStyle = p.anchor ? '#3b82f6' : '#ef4444'; ctx.fill();
+                ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke();
+            });
+
+            // Validation Status
+            const { winding } = validateShape();
+            const statusEl = document.getElementById('statusMsg');
+            statusEl.textContent = winding === 'CCW' ? '✅ CCW Winding' : '⚠️ CW Detected';
+            statusEl.className = winding === 'CCW' ? 'status ok' : 'status warn';
+
+            ctx.restore();
+        }
+
+        // ================= INTERACTION =================
+        let dragIdx = -1, selectedIdx = -1;
+        function selectPoint(idx) {
+            selectedIdx = idx;
+            const panel = document.getElementById('propsPanel');
+            if (idx === -1) { panel.style.display = 'none'; return; }
+            panel.style.display = 'block';
+            document.getElementById('ptIdx').textContent = idx;
+            document.getElementById('ptX').value = pts[idx].x.toFixed(3);
+            document.getElementById('ptY').value = pts[idx].y.toFixed(3);
+        }
+
+        canvas.addEventListener('pointerdown', e => {
+            const rect = canvas.getBoundingClientRect();
+            const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+            dragIdx = -1;
+            for (let i = 0; i < pts.length; i++) {
+                let s = toScreen(pts[i]);
+                if (Math.hypot(mx - s.x, my - s.y) < 12) { dragIdx = i; selectPoint(i); break; }
+            }
+            if (dragIdx === -1) selectPoint(-1);
+            if (dragIdx !== -1) { saveState(); canvas.setPointerCapture(e.pointerId); }
+        });
+
+        canvas.addEventListener('pointermove', e => {
+            if (dragIdx === -1) return;
+            const rect = canvas.getBoundingClientRect();
+            const w = toWorld(e.clientX - rect.left, e.clientY - rect.top);
+            pts[dragIdx].x = w.x; pts[dragIdx].y = w.y;
+            if (selectedIdx === dragIdx) {
+                document.getElementById('ptX').value = w.x.toFixed(3);
+                document.getElementById('ptY').value = w.y.toFixed(3);
+            }
+            draw();
+        });
+
+        canvas.addEventListener('pointerup', () => { dragIdx = -1; });
+
+        ['ptX', 'ptY'].forEach(id => {
+            document.getElementById(id).addEventListener('input', () => {
+                if (selectedIdx === -1) return;
+                pts[selectedIdx].x = parseFloat(document.getElementById('ptX').value) || 0;
+                pts[selectedIdx].y = parseFloat(document.getElementById('ptY').value) || 0;
+                draw();
+            });
+        });
+
+        // ================= PRESETS =================
+        function loadPreset(type) {
+            for (let i = 0; i < 32; i++) {
+                let angle = i * Math.PI / 16;
+                if (type === 'circle') {
+                    let r = 0.85; pts[i].x = r * Math.cos(angle); pts[i].y = r * Math.sin(angle);
+                } else if (type === 'heart') {
+                    let hx = 16 * Math.pow(Math.sin(angle), 3);
+                    let hy = 13 * Math.cos(angle) - 5 * Math.cos(2 * angle) - 2 * Math.cos(3 * angle) - Math.cos(4 * angle);
+                    let maxExt = 16.5;
+                    let curveX = hx / maxExt, curveY = hy / maxExt;
+                    if (i % 2 === 0) { pts[i].x = curveX; pts[i].y = curveY; }
+                    else {
+                        let prev = i - 1, next = (i + 1) % 32;
+                        let aPrevX = 16 * Math.pow(Math.sin(prev * Math.PI / 16), 3) / maxExt;
+                        let aPrevY = (13 * Math.cos(prev * Math.PI / 16) - 5 * Math.cos(2 * prev * Math.PI / 16) - 2 * Math.cos(3 * prev * Math.PI / 16) - Math.cos(4 * prev * Math.PI / 16)) / maxExt;
+                        let aNextX = 16 * Math.pow(Math.sin(next * Math.PI / 16), 3) / maxExt;
+                        let aNextY = (13 * Math.cos(next * Math.PI / 16) - 5 * Math.cos(2 * next * Math.PI / 16) - 2 * Math.cos(3 * next * Math.PI / 16) - Math.cos(4 * next * Math.PI / 16)) / maxExt;
+                        pts[i].x = (aPrevX + aNextX) * 0.5; pts[i].y = (aPrevY + aNextY) * 0.5;
+                    }
+                } else if (type === 'star') {
+                    let anchorIdx = Math.floor(i / 2), isOuter = anchorIdx % 2 === 0;
+                    let r = i % 2 === 0 ? (isOuter ? 0.9 : 0.45) : (isOuter ? 0.75 : 0.55);
+                    pts[i].x = r * Math.cos(angle); pts[i].y = r * Math.sin(angle);
+                }
+            }
+            selectPoint(-1);
+            history = []; historyIdx = -1;
+            saveState();
+            draw();
+        }
+
+        // ================= HIGH-RES EVALUATOR =================
+        function evaluateHighRes(totalPoints) {
+            let ptsArr = [];
+            const perCurve = Math.ceil(totalPoints / 16);
+            for (let i = 0; i < 16; i++) {
+                let p0 = pts[2 * i], p1 = pts[2 * i + 1], p2 = pts[2 * (i + 1) % 32];
+                for (let j = 0; j < perCurve; j++) {
+                    let t = j / perCurve;
+                    let x = (1 - t) ** 2 * p0.x + 2 * (1 - t) * t * p1.x + t ** 2 * p2.x;
+                    let y = (1 - t) ** 2 * p0.y + 2 * (1 - t) * t * p1.y + t ** 2 * p2.y;
+                    if (isFinite(x) && isFinite(y)) ptsArr.push({ x, y });
+                }
+            }
+            return ptsArr;
+        }
+
+        // ================= VALIDATION =================
+        function validateShape() {
+            let x = pts.map(p => p.x), y = pts.map(p => p.y);
+            let area = 0.5 * (x.slice(0, -1).reduce((s, v, i) => s + v * y[i + 1] - x[i + 1] * y[i], 0) + x[x.length - 1] * y[0] - x[0] * y[y.length - 1]);
+            return { winding: area > 0 ? 'CCW' : 'CW' };
+        }
+
+        // ================= EXPORT / IMPORT =================
+        function downloadJSON() {
+            const norm = document.getElementById('normalize').checked;
+            let data = pts.map(p => [parseFloat(p.x.toFixed(4)), parseFloat(p.y.toFixed(4))]);
+            let meta = { version: "1.0", type: "quad_bezier", segments: 16, normalized: norm, winding: validateShape().winding, timestamp: Date.now() };
+            if (norm) {
+                let maxVal = Math.max(...data.flat().map(Math.abs)) || 1;
+                data = data.map(([x, y]) => [x / maxVal, y / maxVal]);
+            }
+            const payload = { meta, points: data };
+            const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a'); a.href = url; a.download = `shape_32pt_v${Date.now().toString().slice(-4)}.json`;
+            document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+            showToast('✅ Exported with metadata');
+        }
+
+        document.getElementById('importInput').addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                try {
+                    const json = JSON.parse(event.target.result);
+                    let points = json.points || json;
+                    if (!Array.isArray(points) || points.length !== 32) throw new Error("Expected exactly 32 points");
+                    points.forEach((p, i) => {
+                        if (!Array.isArray(p) || p.length !== 2) throw new Error(`Point ${i} must be [x, y]`);
+                        pts[i].x = parseFloat(p[0]) || 0;
+                        pts[i].y = parseFloat(p[1]) || 0;
+                    });
+                    history = []; historyIdx = -1;
+                    saveState();
+                    selectPoint(-1);
+                    draw();
+                    showToast('✅ Shape imported successfully');
+                } catch (err) {
+                    showToast('❌ Import failed: ' + err.message, true);
+                }
+            };
+            reader.readAsText(file);
+            e.target.value = '';
+        });
+
+        // ================= UTILS & INIT =================
+        let showHighRes = false;
+        document.getElementById('highRes').addEventListener('change', (e) => {
+            showHighRes = e.target.checked;
+            draw();
+        });
+
+        function showToast(msg, isError = false) {
+            const t = document.getElementById('toast');
+            t.textContent = msg;
+            t.className = isError ? 'show error' : 'show';
+            setTimeout(() => t.classList.remove('show'), 2000);
+        }
+
+        document.addEventListener('keydown', e => {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'z') { e.preventDefault(); undo(); }
+            if ((e.ctrlKey || e.metaKey) && e.key === 'y') { e.preventDefault(); redo(); }
+            if (e.key === 'Escape') selectPoint(-1);
+        });
+
+        loadPreset('circle');
+    </script>
+</body>
+
+</html>
